@@ -359,6 +359,25 @@ static BOOL dedup_property_version(const u8 *set, u32 set_size, le32 magic,
 }
 
 /*
+ *		Set the location of the chunk store from its guid
+ */
+
+static int dedup_set_store(ntfs_dedup *dd, const GUID *store_guid)
+{
+	char guid[37];
+	int i;
+
+	if (!ntfs_guid_to_mbs(store_guid, guid))
+		return (-1);
+	for (i=0; guid[i]; i++)
+		if ((guid[i] >= 'a') && (guid[i] <= 'f'))
+			guid[i] += 'A' - 'a';
+	snprintf(dd->store_path, DEDUP_MAX_PATH, "%s/{%s}.ddp",
+			DEDUP_STORE_PATH, guid);
+	return (0);
+}
+
+/*
  *		Set the parts of a file from an array of stream entries
  *
  *	The parts must be contiguous and cover the whole file.
@@ -404,8 +423,6 @@ static int dedup_parse_properties(ntfs_dedup *dd, const u8 *data, u32 size)
 	const u8 *value;
 	u32 ddrp_size;
 	u32 value_size;
-	char guid[37];
-	int i;
 
 	if (!dedup_property_version(data, size, DEDUP_FERP_MAGIC,
 					DEDUP_FERP_VERSION))
@@ -414,13 +431,8 @@ static int dedup_parse_properties(ntfs_dedup *dd, const u8 *data, u32 size)
 			DEDUP_FERP_STORE_GUID, DEDUP_PROPERTY_GUID,
 			&value_size);
 	if (!value || (value_size != sizeof(GUID))
-	    || !ntfs_guid_to_mbs((const GUID*)value, guid))
+	    || dedup_set_store(dd, (const GUID*)value))
 		return (dedup_corrupt("store guid"));
-	for (i=0; guid[i]; i++)
-		if ((guid[i] >= 'a') && (guid[i] <= 'f'))
-			guid[i] += 'A' - 'a';
-	snprintf(dd->store_path, DEDUP_MAX_PATH, "%s/{%s}.ddp",
-			DEDUP_STORE_PATH, guid);
 	value = dedup_property(data, size, DEDUP_FERP_MAGIC,
 			DEDUP_FERP_FILE_SIZE, DEDUP_PROPERTY_U64, &value_size);
 	if (!value || (value_size != sizeof(le64)))
@@ -438,6 +450,64 @@ static int dedup_parse_properties(ntfs_dedup *dd, const u8 *data, u32 size)
 		return (dedup_corrupt("stream entries"));
 	return (dedup_set_parts(dd, value,
 			value_size / DEDUP_STREAM_ENTRY_SIZE));
+}
+
+/*
+ *		Parse the reparse data of the older long format
+ *
+ *	The data contains an array of stream entries, each one
+ *	describing a part of the file.
+ */
+
+static int dedup_parse_long(ntfs_dedup *dd, const u8 *data, u32 size)
+{
+	const DEDUP_REPARSE_LONG *head;
+	u32 offset;
+	u32 length;
+
+	head = (const DEDUP_REPARSE_LONG*)data;
+	if (size < sizeof(DEDUP_REPARSE_LONG))
+		return (dedup_corrupt("reparse data"));
+	offset = le16_to_cpu(head->streams_offset);
+	length = le16_to_cpu(head->streams_size);
+	if (!length || (length % DEDUP_STREAM_ENTRY_SIZE)
+	    || (offset > size) || (length > (size - offset)))
+		return (dedup_corrupt("stream entries"));
+	if (dedup_set_store(dd, &head->store_guid))
+		return (dedup_corrupt("store guid"));
+	dd->size = le64_to_cpu(((const DEDUP_STREAM_ENTRY*)&data[offset
+			+ length - DEDUP_STREAM_ENTRY_SIZE])->part_end);
+	return (dedup_set_parts(dd, &data[offset],
+			length / DEDUP_STREAM_ENTRY_SIZE));
+}
+
+/*
+ *		Parse the reparse data of the older short format
+ *
+ *	The data contains a single stream entry describing the whole
+ *	file, though its digest is 32-byte long and overlaps the end
+ *	of the entry. Only the first 16 bytes of the digest are checked
+ *	and the bounds of the part are taken from the header.
+ */
+
+static int dedup_parse_short(ntfs_dedup *dd, const u8 *data, u32 size)
+{
+	const DEDUP_REPARSE_SHORT *head;
+	u8 entry[DEDUP_STREAM_ENTRY_SIZE];
+	DEDUP_STREAM_ENTRY *pentry;
+
+	head = (const DEDUP_REPARSE_SHORT*)data;
+	if (size < (sizeof(DEDUP_REPARSE_SHORT) + DEDUP_STREAM_ENTRY_SIZE))
+		return (dedup_corrupt("reparse data"));
+	if (dedup_set_store(dd, &head->store_guid))
+		return (dedup_corrupt("store guid"));
+	memcpy(entry, &data[sizeof(DEDUP_REPARSE_SHORT)],
+			DEDUP_STREAM_ENTRY_SIZE);
+	pentry = (DEDUP_STREAM_ENTRY*)entry;
+	pentry->part_end = head->file_size;
+	pentry->part_begin = const_cpu_to_le64(0);
+	dd->size = le64_to_cpu(head->file_size);
+	return (dedup_set_parts(dd, entry, 1));
 }
 
 /*
@@ -481,6 +551,12 @@ ntfs_dedup *ntfs_dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse)
 	switch (format) {
 	case DEDUP_FORMAT_PROPERTIES :
 		res = dedup_parse_properties(dd, &data[4], size - 8);
+		break;
+	case DEDUP_FORMAT_LONG :
+		res = dedup_parse_long(dd, data, size - 4);
+		break;
+	case DEDUP_FORMAT_SHORT :
+		res = dedup_parse_short(dd, data, size - 4);
 		break;
 	default :
 		ntfs_log_error("Unsupported deduplication format 0x%04x"

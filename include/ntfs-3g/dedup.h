@@ -242,6 +242,36 @@ enum {
 	DEDUP_DDRP_STREAMS = 2,
 } ;
 
+/*
+ *	Reparse data of the older formats, used by Windows Server 2012.
+ *	The offsets are relative to the beginning of the reparse data,
+ *	after the generic reparse point header.
+ */
+typedef struct {
+/*  0*/	le16 format;		/* DEDUP_FORMAT_LONG */
+/*  2*/	le16 length;
+/*  4*/	le32 unknown1[16];
+/* 44*/	le16 size1;
+/* 46*/	le16 offset1;
+/* 48*/	le32 unknown2;
+/* 4c*/	le16 streams_size;	/* size of the stream entries */
+/* 4e*/	le16 streams_offset;	/* location of the stream entries */
+/* 50*/	le32 unknown3[9];
+/* 74*/	GUID store_guid;
+/* 84*/	le32 unknown4[4];
+} __attribute__((__packed__)) DEDUP_REPARSE_LONG;
+
+typedef struct {
+/*  0*/	le16 format;		/* DEDUP_FORMAT_SHORT */
+/*  2*/	le16 length;
+/*  4*/	le32 unknown1;
+/*  8*/	le64 file_size;
+/* 10*/	le32 unknown2[2];
+/* 18*/	GUID store_guid;
+/* 28*/	le32 unknown3[4];
+		/* followed by a stream entry with a 32-byte digest */
+} __attribute__((__packed__)) DEDUP_REPARSE_SHORT;
+
 typedef struct DEDUP_FILE ntfs_dedup;
 
 ntfs_dedup *ntfs_dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse);
