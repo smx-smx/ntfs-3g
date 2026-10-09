@@ -45,6 +45,8 @@
 #include "volume.h"
 #include "debug.h"
 #include "dir.h"
+#include "reparse.h"
+#include "dedup.h"
 #include "ntfscat.h"
 /* #include "version.h" */
 #include "utils.h"
@@ -402,6 +404,51 @@ out:
 	return ret;
 }
 
+/*
+ *		Output the content of a deduplicated file
+ */
+
+static int cat_dedup(ntfs_inode *inode, const REPARSE_POINT *reparse)
+{
+	ntfs_dedup *dd;
+	char *buffer;
+	s64 bytes_read, written;
+	s64 offset;
+	const u32 bufsize = 65536;
+	int ret = 1;
+
+	dd = ntfs_dedup_open(inode, reparse);
+	if (!dd) {
+		ntfs_log_perror("ERROR: Couldn't open deduplicated file");
+		return ret;
+	}
+	buffer = malloc(bufsize);
+	if (!buffer)
+		goto out;
+	offset = 0;
+	for (;;) {
+		bytes_read = ntfs_dedup_pread(dd, offset, bufsize, buffer);
+		if (bytes_read == -1) {
+			ntfs_log_perror("ERROR: Couldn't read file");
+			goto out;
+		}
+		if (!bytes_read)
+			break;
+		written = fwrite(buffer, 1, bytes_read, stdout);
+		if (written != bytes_read) {
+			ntfs_log_perror("ERROR: Couldn't output all data!");
+			goto out;
+		}
+		offset += bytes_read;
+	}
+	if (offset == ntfs_dedup_size(dd))
+		ret = 0;
+out:
+	free(buffer);
+	ntfs_dedup_close(dd);
+	return ret;
+}
+
 /**
  * main - Begin here
  *
@@ -414,6 +461,7 @@ int main(int argc, char *argv[])
 {
 	ntfs_volume *vol;
 	ntfs_inode *inode;
+	REPARSE_POINT *reparse;
 	ATTR_TYPES attr;
 	int res;
 	int result = 1;
@@ -460,7 +508,16 @@ int main(int argc, char *argv[])
 	if (opts.attr != const_cpu_to_le32(-1))
 		attr = opts.attr;
 
-	result = cat(vol, inode, attr, opts.attr_name, opts.attr_name_len);
+	reparse = (REPARSE_POINT*)NULL;
+	if ((attr == AT_DATA) && !opts.attr_name_len && !opts.raw
+	    && (inode->flags & FILE_ATTR_REPARSE_POINT))
+		reparse = ntfs_get_reparse_point(inode);
+	if (reparse && (reparse->reparse_tag == IO_REPARSE_TAG_DEDUP))
+		result = cat_dedup(inode, reparse);
+	else
+		result = cat(vol, inode, attr, opts.attr_name,
+				opts.attr_name_len);
+	free(reparse);
 
 	ntfs_inode_close(inode);
 	ntfs_umount(vol, FALSE);
