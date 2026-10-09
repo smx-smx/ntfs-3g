@@ -12,6 +12,9 @@ ntfscat \- print NTFS files and streams on the standard output
 will read a file or stream from an NTFS volume and display the contents
 on the standard output.
 .PP
+When the file has been deduplicated by Windows, the content designated by
+its reparse point is displayed.
+.PP
 The case of the filename passed to
 .B ntfscat
 is ignored.

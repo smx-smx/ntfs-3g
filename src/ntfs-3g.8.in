@@ -108,6 +108,20 @@ cat some.mp3:artist
 Named data streams act like normal files, so you can read from them, write to
 them and even delete them (using rm).  You can list all the named data streams
 a file has by getting the \fBntfs.streams.list\fP extended attribute.
+.SS Data Deduplication
+Windows Server can deduplicate the files of a volume : identical chunks of
+data are stored only once, in a chunk store located in the directory
+"System Volume Information/Dedup", and the content of each file is replaced
+by a reparse point designating its chunks.
+.PP
+Deduplicated files can be read by \fBntfs-3g\fR and \fBlowntfs-3g\fR,
+they are shown as read-only regular files. Writing to them is not supported,
+as Windows would first have to restore their content. The files in the chunk
+store should not be modified, and when a deduplicated file is deleted, the
+space used by its chunks is only reclaimed by the Windows garbage collection.
+.PP
+The chunks are checked when reading, and an error is returned if the chunk
+store is damaged.
 .SH OPTIONS
 Below is a summary of the options that \fBntfs-3g\fR accepts.
 .TP
