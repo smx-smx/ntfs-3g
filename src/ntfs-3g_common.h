@@ -70,6 +70,8 @@ enum {
 	OPT_WINDOWS_NAMES,
 	OPT_COMPRESSION,
 	OPT_NOCOMPRESSION,
+	OPT_DEDUP_WRITES,
+	OPT_NODEDUP_WRITES,
 	OPT_SILENT,
 	OPT_RECOVER,
 	OPT_NORECOVER,
@@ -147,6 +149,7 @@ typedef struct {
 	BOOL windows_names;
 	BOOL ignore_case;
 	BOOL compression;
+	BOOL dedup_writes;
 	BOOL acl;
 	BOOL silent;
 	BOOL recover;
@@ -219,6 +222,7 @@ int register_reparse_plugin(ntfs_fuse_context_t *ctx, le32 tag,
                                 const plugin_operations_t *ops, void *handle);
 
 extern const plugin_operations_t dedup_plugin_ops;
+extern const plugin_operations_t dedup_ro_plugin_ops;
 
 #endif /* DISABLE_PLUGINS */
 

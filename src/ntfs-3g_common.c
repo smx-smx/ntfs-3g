@@ -105,6 +105,8 @@ const struct DEFOPTION optionlist[] = {
 	{ "windows_names", OPT_WINDOWS_NAMES, FLGOPT_BOGUS },
 	{ "compression", OPT_COMPRESSION, FLGOPT_BOGUS },
 	{ "nocompression", OPT_NOCOMPRESSION, FLGOPT_BOGUS },
+	{ "dedup_writes", OPT_DEDUP_WRITES, FLGOPT_BOGUS },
+	{ "nodedup_writes", OPT_NODEDUP_WRITES, FLGOPT_BOGUS },
 	{ "silent", OPT_SILENT, FLGOPT_BOGUS },
 	{ "recover", OPT_RECOVER, FLGOPT_BOGUS },
 	{ "norecover", OPT_NORECOVER, FLGOPT_BOGUS },
@@ -312,6 +314,7 @@ char *parse_mount_options(ntfs_fuse_context_t *ctx,
 	ctx->efs_raw = FALSE;
 #endif /* HAVE_SETXATTR */
 	ctx->compression = DEFAULT_COMPRESSION;
+	ctx->dedup_writes = TRUE;
 	options = strdup(orig_opts ? orig_opts : "");
 	if (!options) {
 		ntfs_log_perror("%s: strdup failed", EXEC_NAME);
@@ -435,6 +438,12 @@ char *parse_mount_options(ntfs_fuse_context_t *ctx,
 				break;
 			case OPT_NOCOMPRESSION :
 				ctx->compression = FALSE;
+				break;
+			case OPT_DEDUP_WRITES :
+				ctx->dedup_writes = TRUE;
+				break;
+			case OPT_NODEDUP_WRITES :
+				ctx->dedup_writes = FALSE;
 				break;
 			case OPT_SILENT :
 				ctx->silent = TRUE;
@@ -1078,6 +1087,37 @@ const plugin_operations_t dedup_plugin_ops = {
 	.read = dedup_read,
 	.write = dedup_write,
 	.truncate = dedup_truncate,
+} ;
+
+/*
+ *		Variants for denying writing to deduplicated files
+ *		(option nodedup_writes)
+ */
+
+static int dedup_ro_getattr(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			struct stat *stbuf)
+{
+	int res;
+
+	res = dedup_getattr(ni, reparse, stbuf);
+	if (!res)
+		stbuf->st_mode = S_IFREG | 0555;
+	return (res);
+}
+
+static int dedup_ro_open(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			struct fuse_file_info *fi)
+{
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return (-EOPNOTSUPP);
+	return (dedup_open(ni, reparse, fi));
+}
+
+const plugin_operations_t dedup_ro_plugin_ops = {
+	.getattr = dedup_ro_getattr,
+	.open = dedup_ro_open,
+	.release = dedup_release,
+	.read = dedup_read,
 } ;
 
 void close_reparse_plugins(ntfs_fuse_context_t *ctx)
