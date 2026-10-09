@@ -115,13 +115,16 @@ data are stored only once, in a chunk store located in the directory
 by a reparse point designating its chunks.
 .PP
 Deduplicated files can be read by \fBntfs-3g\fR and \fBlowntfs-3g\fR,
-they are shown as read-only regular files. Writing to them is not supported,
-as Windows would first have to restore their content. The files in the chunk
-store should not be modified, and when a deduplicated file is deleted, the
-space used by its chunks is only reclaimed by the Windows garbage collection.
-.PP
+including the parts which Windows has modified since they were deduplicated.
 The chunks are checked when reading, and an error is returned if the chunk
 store is damaged.
+.PP
+When a deduplicated file is written to or truncated, it is first restored
+as a plain file, which requires free space for its full content, unless it
+is truncated to zero. Windows may deduplicate it again later. The chunks
+it used, as well as the chunks of deleted deduplicated files, are only
+reclaimed by the Windows garbage collection. The files in the chunk store
+should not be modified.
 .SH OPTIONS
 Below is a summary of the options that \fBntfs-3g\fR accepts.
 .TP

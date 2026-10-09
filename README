@@ -19,7 +19,7 @@ ownership and permissions, POSIX ACLs, junction points, extended attributes
 and creating internally compressed files (parameter files in the directory
 .NTFS-3G may be required to enable them). The new compressed file formats
 available in Windows 10 can also be read through a plugin, and the files
-deduplicated by Windows Server can be read.
+deduplicated by Windows Server can be read and written to.
 
 News, support answers, problem submission instructions, support and discussion 
 forums, and other information are available on the project web site at
