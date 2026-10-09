@@ -13,6 +13,7 @@ headers = \
 	compress.h	\
 	debug.h		\
 	decompress.h	\
+	dedup.h		\
 	device.h	\
 	device_io.h	\
 	dir.h		\
