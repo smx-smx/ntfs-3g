@@ -72,6 +72,7 @@
 #include "volume.h"
 #include "unistr.h"
 #include "security.h"
+#include "reparse.h"
 #include "decompress.h"
 #include "dedup.h"
 #include "misc.h"
@@ -1643,4 +1644,108 @@ s64 ntfs_dedup_pread(ntfs_dedup *dd, ntfs_inode *ni, s64 pos, s64 count,
 		total += n;
 	}
 	return (total);
+}
+
+/*
+ *		Restore the content of a deduplicated file
+ *
+ *	The content is copied from the chunk store to the data stream of
+ *	the file, the data stream is resized to the requested size, and the
+ *	reparse point is removed. The ranges already recalled by Windows
+ *	are left in place, and only the content within the requested size
+ *	is copied, so truncating to zero copies nothing.
+ *
+ *	The reparse point is only removed after the content has been
+ *	written, so that the file remains readable as a deduplicated file
+ *	if anything fails. The chunks are not released, they will be by
+ *	the Windows garbage collection.
+ *
+ *	A negative size keeps the current size.
+ *
+ *	Returns 0 if successful, or -1 with errno set
+ */
+
+int ntfs_dedup_rehydrate(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			s64 size)
+{
+	ntfs_dedup *dd;
+	ntfs_attr *na;
+	ntfs_volume *vol;
+	u64 keep;
+	u64 pos;
+	u64 end;
+	s64 needed;
+	s64 n;
+	int recalled;
+	int res;
+
+	res = -1;
+	na = (ntfs_attr*)NULL;
+	dd = ntfs_dedup_open(ni, reparse);
+	if (!dd)
+		return (-1);
+	if (size < 0)
+		size = dd->size;
+	keep = ((u64)size < dd->size ? (u64)size : dd->size);
+	na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+	if (!na)
+		goto out;
+		/* avoid failing midway for lack of space */
+	vol = ni->vol;
+	needed = (((s64)keep + vol->cluster_size - 1)
+			>> vol->cluster_size_bits)
+		- (ni->allocated_size >> vol->cluster_size_bits);
+	if ((vol->free_clusters >= 0) && (needed > vol->free_clusters)) {
+		errno = ENOSPC;
+		goto out;
+	}
+	pos = 0;
+	while (pos < keep) {
+		end = keep;
+		recalled = 0;
+		if (dd->recall.kind != DEDUP_RECALL_NONE) {
+			if (pos >= dd->recall.tracked)
+				recalled = 1;
+			else {
+				recalled = dedup_recall_query(dd, pos, &end);
+				if (recalled < 0)
+					goto out;
+				if (end > dd->recall.tracked)
+					end = dd->recall.tracked;
+			}
+			if (end > keep)
+				end = keep;
+		}
+		if (!recalled) {
+			if (dedup_seek_chunk(dd, pos))
+				goto out;
+			if (end > dd->chunk_end)
+				end = dd->chunk_end;
+			n = end - pos;
+			if (ntfs_attr_pwrite(na, pos, n,
+				    &dd->chunk[pos - dd->chunk_begin]) != n) {
+				if (!errno)
+					errno = EIO;
+				goto out;
+			}
+		}
+		pos = end;
+	}
+	if (ntfs_attr_truncate(na, size))
+		goto out;
+	ntfs_attr_close(na);
+	na = (ntfs_attr*)NULL;
+	if (ntfs_remove_ntfs_reparse_data(ni))
+		goto out;
+	ntfs_log_info("Restored deduplicated file %lld\n",
+			(long long)ni->mft_no);
+	res = 0;
+out :
+	if (na)
+		ntfs_attr_close(na);
+	ntfs_dedup_close(dd);
+	if (res)
+		ntfs_log_perror("Could not restore deduplicated file %lld",
+				(long long)ni->mft_no);
+	return (res);
 }

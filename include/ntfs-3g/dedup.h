@@ -349,5 +349,7 @@ s64 ntfs_dedup_pread(ntfs_dedup *dd, ntfs_inode *ni, s64 pos, s64 count,
 			void *b);
 s64 ntfs_dedup_size(const ntfs_dedup *dd);
 void ntfs_dedup_close(ntfs_dedup *dd);
+int ntfs_dedup_rehydrate(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			s64 size);
 
 #endif /* _NTFS_DEDUP_H */
