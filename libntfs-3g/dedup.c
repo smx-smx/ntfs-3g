@@ -136,6 +136,7 @@ struct DEDUP_RECALL {
 	u64 flat_unit;		/* bytes per bit of a flat bitmap */
 	u32 bitmap_size;
 	u8 *bitmap;		/* root page or flat bitmap */
+	BOOL has_identity;	/* stream id and file guid known */
 	u32 stream_sequence;
 	u32 stream_container_id;
 	GUID file_guid;
@@ -525,12 +526,34 @@ static int dedup_parse_recall(ntfs_dedup *dd, ntfs_inode *ni,
 	if (!dedup_property_version(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
 					DEDUP_RBRP_VERSION))
 		return (dedup_corrupt("recall properties"));
+		/* identity of the recall bitmap files */
+	if (dedup_get_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+			DEDUP_RBRP_STREAM_ID, DEDUP_PROPERTY_U64,
+			&value, &value_size, FALSE)
+	    || (value && (value_size != sizeof(le64))))
+		return (dedup_corrupt("recall stream id"));
+	if (value) {
+		recall->stream_sequence = le32_to_cpup((const le32*)value);
+		recall->stream_container_id =
+				le32_to_cpup((const le32*)&value[4]);
+		if (dedup_get_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+				DEDUP_RBRP_FILE_GUID, DEDUP_PROPERTY_GUID,
+				&value, &value_size, FALSE)
+		    || (value && (value_size != sizeof(GUID))))
+			return (dedup_corrupt("recall file guid"));
+		if (value) {
+			memcpy(&recall->file_guid, value, sizeof(GUID));
+			recall->has_identity = TRUE;
+		}
+	}
 	if (dedup_get_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
 			DEDUP_RBRP_BITMAP, DEDUP_PROPERTY_BLOB,
 			&bitmap, &bitmap_size, FALSE))
 		return (-1);
 	if (!bitmap)
 		return (0);	/* nothing recalled */
+	if (!recall->has_identity)
+		return (dedup_corrupt("recall identity"));
 	if (bitmap_type != DEDUP_BITMAP_NORMAL) {
 		ntfs_log_error("Unsupported deduplication recall bitmap"
 				" type %lu in inode %lld\n",
@@ -548,17 +571,6 @@ static int dedup_parse_recall(ntfs_dedup *dd, ntfs_inode *ni,
 		return (-1);
 	if (!shift)
 		shift = DEDUP_DEFAULT_RECALL_SHIFT;
-	value = dedup_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
-			DEDUP_RBRP_STREAM_ID, DEDUP_PROPERTY_U64, &value_size);
-	if (!value || (value_size != sizeof(le64)))
-		return (dedup_corrupt("recall stream id"));
-	recall->stream_sequence = le32_to_cpup((const le32*)value);
-	recall->stream_container_id = le32_to_cpup((const le32*)&value[4]);
-	value = dedup_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
-			DEDUP_RBRP_FILE_GUID, DEDUP_PROPERTY_GUID, &value_size);
-	if (!value || (value_size != sizeof(GUID)))
-		return (dedup_corrupt("recall file guid"));
-	memcpy(&recall->file_guid, value, sizeof(GUID));
 	if ((shift < 9) || (shift > 30))
 		return (dedup_corrupt("recall unit"));
 	recall->shift = shift;
@@ -1410,6 +1422,37 @@ static BOOL dedup_valid_page(const u8 *page)
 }
 
 /*
+ *		Check the header of a recall bitmap level file
+ *
+ *	One of the two header slots must be valid and designate the
+ *	expected level of the bitmap of the file.
+ */
+
+static BOOL dedup_valid_level_file(ntfs_attr *na,
+			const struct DEDUP_RECALL *recall, u32 level, u8 *page)
+{
+	const DEDUP_RKBM_HEADER *head;
+	BOOL ok;
+	int i;
+
+	head = (const DEDUP_RKBM_HEADER*)page;
+	ok = FALSE;
+	for (i=0; (i<2) && !ok; i++)
+		ok = !dedup_pread(na, i*DEDUP_RKBM_PAGE_SIZE,
+				DEDUP_RKBM_PAGE_SIZE, page)
+		    && dedup_valid_page(page)
+		    && (head->common.magic == DEDUP_RKBM_MAGIC)
+		    && (le32_to_cpu(head->level) == level)
+		    && (le32_to_cpu(head->stream_sequence)
+				== recall->stream_sequence)
+		    && (le32_to_cpu(head->stream_container_id)
+				== recall->stream_container_id)
+		    && !memcmp(&head->file_guid, &recall->file_guid,
+				sizeof(GUID));
+	return (ok);
+}
+
+/*
  *		Read a page from a level file of the recall bitmap
  *
  *	The level file is checked when it is first opened, and the last
@@ -1422,12 +1465,10 @@ static const u8 *dedup_recall_page(ntfs_dedup *dd, u32 level, s64 offset)
 {
 	struct DEDUP_RECALL *recall;
 	char path[DEDUP_MAX_PATH + 40];
-	const DEDUP_RKBM_HEADER *head;
 	ntfs_inode *ni;
 	ntfs_attr *na;
 	u8 *page;
 	BOOL ok;
-	int i;
 
 	recall = &dd->recall;
 	if (recall->page_offset[level] == offset)
@@ -1460,20 +1501,7 @@ static const u8 *dedup_recall_page(ntfs_dedup *dd, u32 level, s64 offset)
 	ok = FALSE;
 	if (na) {
 		if (!recall->level_mref[level]) {
-			/* one of the two header slots must match */
-			head = (const DEDUP_RKBM_HEADER*)page;
-			for (i=0; (i<2) && !ok; i++)
-				ok = !dedup_pread(na, i*DEDUP_RKBM_PAGE_SIZE,
-						DEDUP_RKBM_PAGE_SIZE, page)
-				    && dedup_valid_page(page)
-				    && (head->common.magic == DEDUP_RKBM_MAGIC)
-				    && (le32_to_cpu(head->level) == level)
-				    && (le32_to_cpu(head->stream_sequence)
-					== recall->stream_sequence)
-				    && (le32_to_cpu(head->stream_container_id)
-					== recall->stream_container_id)
-				    && !memcmp(&head->file_guid,
-					&recall->file_guid, sizeof(GUID));
+			ok = dedup_valid_level_file(na, recall, level, page);
 			if (ok)
 				recall->level_mref[level] = MK_MREF(ni->mft_no,
 					le16_to_cpu(ni->mrec->sequence_number));
@@ -1647,6 +1675,79 @@ s64 ntfs_dedup_pread(ntfs_dedup *dd, ntfs_inode *ni, s64 pos, s64 count,
 }
 
 /*
+ *		Delete the recall bitmap files of a restored file
+ *
+ *	This is what Windows does when a file stops being deduplicated.
+ *	The level files are only deleted when the bitmap is in use by the
+ *	file, as unused level files are left in place by Windows and may
+ *	be shared with another file having a copy of the reparse data. A
+ *	level file is also only deleted when its header designates the
+ *	bitmap of the file. Errors are only logged, as stale files do no
+ *	harm.
+ */
+
+static void dedup_remove_recall_bitmaps(ntfs_dedup *dd)
+{
+	struct DEDUP_RECALL *recall;
+	char path[DEDUP_MAX_PATH + 40];
+	char name[24];
+	ntfs_inode *dir_ni;
+	ntfs_inode *ni;
+	ntfs_attr *na;
+	ntfschar *uname;
+	u8 *page;
+	BOOL ok;
+	int len;
+	u32 level;
+
+	recall = &dd->recall;
+	if ((recall->kind != DEDUP_RECALL_TREE) || !recall->depth
+	    || !recall->has_identity)
+		return;
+	page = (u8*)ntfs_malloc(DEDUP_RKBM_PAGE_SIZE);
+	if (!page)
+		return;
+	snprintf(path, sizeof(path), "%s/COW/%08lx", dd->store_path,
+			(long)recall->stream_container_id);
+	for (level=0; level<recall->depth; level++) {
+		dir_ni = ntfs_pathname_to_inode(dd->vol, (ntfs_inode*)NULL,
+				path);
+		if (!dir_ni)
+			break;
+		snprintf(name, sizeof(name), "%08lx.%02lx.RB",
+				(long)recall->stream_sequence, (long)level);
+		ni = ntfs_pathname_to_inode(dd->vol, dir_ni, name);
+		ok = FALSE;
+		if (ni) {
+			na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+			if (na) {
+				ok = dedup_valid_level_file(na, recall,
+						level, page);
+				ntfs_attr_close(na);
+			}
+			if (!ok)
+				ntfs_log_error("Not deleting unexpected recall"
+					" bitmap %s/%s\n", path, name);
+		}
+		uname = (ntfschar*)NULL;
+		len = ntfs_mbstoucs(name, &uname);
+		if (ok && (len > 0)) {
+			/* ntfs_delete() closes both inodes */
+			if (ntfs_delete(dd->vol, (char*)NULL, ni, dir_ni,
+					uname, len))
+				ntfs_log_perror("Could not delete recall"
+					" bitmap %s/%s", path, name);
+		} else {
+			if (ni)
+				ntfs_inode_close(ni);
+			ntfs_inode_close(dir_ni);
+		}
+		free(uname);
+	}
+	free(page);
+}
+
+/*
  *		Restore the content of a deduplicated file
  *
  *	The content is copied from the chunk store to the data stream of
@@ -1657,8 +1758,10 @@ s64 ntfs_dedup_pread(ntfs_dedup *dd, ntfs_inode *ni, s64 pos, s64 count,
  *
  *	The reparse point is only removed after the content has been
  *	written, so that the file remains readable as a deduplicated file
- *	if anything fails. The chunks are not released, they will be by
- *	the Windows garbage collection.
+ *	if anything fails. As done by Windows, the recall bitmap files of
+ *	the file are then deleted. The chunks are not released, the stream
+ *	map is detected as unreferenced and released by the next full
+ *	garbage collection of Windows.
  *
  *	A negative size keeps the current size.
  *
@@ -1739,6 +1842,7 @@ int ntfs_dedup_rehydrate(ntfs_inode *ni, const REPARSE_POINT *reparse,
 		goto out;
 	ntfs_log_info("Restored deduplicated file %lld\n",
 			(long long)ni->mft_no);
+	dedup_remove_recall_bitmaps(dd);
 	res = 0;
 out :
 	if (na)
