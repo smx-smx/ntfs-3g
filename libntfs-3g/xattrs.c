@@ -596,6 +596,15 @@ int ntfs_xattr_system_getxattr(struct SECURITY_CONTEXT *scx,
 		res = -errno;
 		break;
 	}
+		/*
+		 * The getters return the size of the value even when
+		 * it does not fit into the buffer, which nothing was
+		 * copied to. This has to be reported as an error.
+		 */
+	if (size && (res > (int)size)) {
+		errno = ERANGE;
+		res = -ERANGE;
+	}
 	return (res);
 }
 
