@@ -57,6 +57,7 @@
 #define DEDUP_FERP_MAGIC const_cpu_to_le32(0x70526546) /* "FeRp" */
 #define DEDUP_RBRP_MAGIC const_cpu_to_le32(0x70526252) /* "RbRp" */
 #define DEDUP_DDRP_MAGIC const_cpu_to_le32(0x70526444) /* "DdRp" */
+#define DEDUP_RKBM_MAGIC const_cpu_to_le32(0x6d426b52) /* "RkBm" */
 
 /*
  *	Formats of reparse data, as major and minor bytes
@@ -237,10 +238,79 @@ enum {
 	DEDUP_FERP_VERSION = 0,
 	DEDUP_FERP_STORE_GUID = 2,
 	DEDUP_FERP_FILE_SIZE = 4,
+	DEDUP_FERP_BITMAP_TYPE = 6,
+	DEDUP_FERP_RBRP = 7,
 	DEDUP_FERP_DDRP = 8,
 	DEDUP_DDRP_VERSION = 0,
 	DEDUP_DDRP_STREAMS = 2,
 } ;
+
+/*
+ *	Recall bitmap
+ *
+ *	When Windows writes to a deduplicated file, the ranges written to
+ *	are first copied from the chunk store to the data stream of the
+ *	file ("recalled"), and the recall bitmap records which ranges of
+ *	the file are now found in the data stream. The file keeps its
+ *	reparse point until it is deduplicated again. Data beyond the size
+ *	tracked by the bitmap (the original file size) is always found in
+ *	the data stream.
+ *
+ *	The state of the bitmap is described by the RbRp property set.
+ *	When it has no bitmap, nothing has been recalled.
+ *
+ *	The bitmap is a tree whose root is a page stored in the reparse
+ *	data, and whose lower levels are stored in files
+ *	"{store-guid}.ddp/COW/<stream container>/<stream seq>.<level>.RB".
+ *	Each bit of a leaf page tells whether a unit of 1 << recall_shift
+ *	bytes has been recalled. Each 2-bit entry of an upper level page
+ *	tells whether none (0) or all (3) of the corresponding leaf range
+ *	has been recalled, or locates the child page (1 or 2, as each
+ *	child page has two slots to allow for atomic updates).
+ *
+ *	A level file begins with two slots for its header, followed by the
+ *	two slots of each block. Every page ends with a CRC-32 of the
+ *	preceding bytes.
+ *
+ *	An older format of the bitmap is a flat bitmap stored in the reparse
+ *	data, each bit telling whether a unit of flat_unit * 64KiB bytes
+ *	has been recalled.
+ */
+enum {
+	DEDUP_RBRP_VERSION = 0,
+	DEDUP_RBRP_RECALL_SHIFT = 1,
+	DEDUP_RBRP_BITMAP_DEPTH = 2,
+	DEDUP_RBRP_STREAM_ID = 4,
+	DEDUP_RBRP_FILE_GUID = 5,
+	DEDUP_RBRP_BITMAP = 6,
+	DEDUP_RBRP_FLAT_UNIT = 7,
+} ;
+
+enum {
+	DEDUP_BITMAP_NORMAL = 0,
+	DEDUP_BITMAP_SNAPSHOT = 1,
+	DEDUP_BITMAP_FILESYSTEM = 2,
+} ;
+
+#define DEDUP_RKBM_PAGE_SIZE 4096
+#define DEDUP_RKBM_PAGE_DATA (DEDUP_RKBM_PAGE_SIZE - 4)
+#define DEDUP_RKBM_LEAF_ENTRIES (DEDUP_RKBM_PAGE_DATA * 8)
+#define DEDUP_RKBM_NODE_ENTRIES (DEDUP_RKBM_PAGE_DATA * 4)
+#define DEDUP_RKBM_FIRST_BLOCK 0x2000
+#define DEDUP_RKBM_BLOCK_SIZE 0x2000
+
+/*
+ *	Header of a recall bitmap level file
+ */
+typedef struct {
+/*  0*/	DEDUP_COMMON_HEADER common;
+/*  8*/	le32 stream_sequence;
+/*  c*/	le32 stream_container_id;
+/* 10*/	le32 level;
+/* 14*/	le32 unknown1;
+/* 18*/	le64 sequence;
+/* 20*/	GUID file_guid;
+} __attribute__((__packed__)) DEDUP_RKBM_HEADER;
 
 /*
  *	Reparse data of the older formats, used by Windows Server 2012.
@@ -275,7 +345,8 @@ typedef struct {
 typedef struct DEDUP_FILE ntfs_dedup;
 
 ntfs_dedup *ntfs_dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse);
-s64 ntfs_dedup_pread(ntfs_dedup *dd, s64 pos, s64 count, void *b);
+s64 ntfs_dedup_pread(ntfs_dedup *dd, ntfs_inode *ni, s64 pos, s64 count,
+			void *b);
 s64 ntfs_dedup_size(const ntfs_dedup *dd);
 void ntfs_dedup_close(ntfs_dedup *dd);
 

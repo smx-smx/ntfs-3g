@@ -427,7 +427,8 @@ static int cat_dedup(ntfs_inode *inode, const REPARSE_POINT *reparse)
 		goto out;
 	offset = 0;
 	for (;;) {
-		bytes_read = ntfs_dedup_pread(dd, offset, bufsize, buffer);
+		bytes_read = ntfs_dedup_pread(dd, inode, offset, bufsize,
+				buffer);
 		if (bytes_read == -1) {
 			ntfs_log_perror("ERROR: Couldn't read file");
 			goto out;

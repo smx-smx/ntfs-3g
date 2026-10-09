@@ -36,6 +36,10 @@
  *	through the redirection table of the container, using the sequence
  *	number of the chunk.
  *
+ *	When Windows writes to a deduplicated file, the ranges written
+ *	are recalled into the data stream of the file, and a recall
+ *	bitmap tells which ranges have to be read from the data stream.
+ *
  *	Opening a file only parses its reparse data. The stream map of
  *	the part being read and the last chunk read are kept in the
  *	context, so that sequential reads only decompress each chunk once.
@@ -114,9 +118,36 @@ struct DEDUP_PART {
 	DEDUP_STREAM_ENTRY entry;
 } ;
 
+enum {
+	DEDUP_RECALL_NONE,	/* nothing recalled */
+	DEDUP_RECALL_TREE,	/* recall bitmap as a tree */
+	DEDUP_RECALL_FLAT,	/* older flat recall bitmap */
+} ;
+
+#define DEDUP_DEFAULT_RECALL_SHIFT 12
+#define DEDUP_MAX_BITMAP_DEPTH 2
+
+struct DEDUP_RECALL {
+	int kind;
+	u32 shift;		/* log2 of the size of a recall unit */
+	u32 depth;		/* levels stored in files */
+	u64 tracked;		/* size tracked by the bitmap */
+	u64 flat_unit;		/* bytes per bit of a flat bitmap */
+	u32 bitmap_size;
+	u8 *bitmap;		/* root page or flat bitmap */
+	u32 stream_sequence;
+	u32 stream_container_id;
+	GUID file_guid;
+		/* level files and the last page read from each */
+	MFT_REF level_mref[DEDUP_MAX_BITMAP_DEPTH];
+	s64 page_offset[DEDUP_MAX_BITMAP_DEPTH];
+	u8 *page[DEDUP_MAX_BITMAP_DEPTH];
+} ;
+
 struct DEDUP_FILE {
 	ntfs_volume *vol;
 	u64 size;
+	struct DEDUP_RECALL recall;
 	char store_path[DEDUP_MAX_PATH];
 	MFT_REF dir_mref[DEDUP_DIR_COUNT];
 	int part_count;
@@ -302,14 +333,16 @@ static int dedup_corrupt(const char *what)
 /*
  *		Get a property from a property set
  *
- *	The property set is checked when getting its first property.
+ *	The property set is checked when getting a property. An optional
+ *	property may be absent or empty, the value is then set to NULL.
  *
- *	Returns the location of the property value,
- *		or NULL if it is not present or the property set is bad
+ *	Returns 0 if successful, or -1 if the property set is bad
+ *		or a required property is missing
  */
 
-static const u8 *dedup_property(const u8 *set, u32 set_size, le32 magic,
-			int index, int type, u32 *psize)
+static int dedup_get_property(const u8 *set, u32 set_size, le32 magic,
+			int index, int type, const u8 **pvalue, u32 *psize,
+			BOOL required)
 {
 	const DEDUP_PROPERTY_SET *head;
 	const DEDUP_PROPERTY *prop;
@@ -317,6 +350,8 @@ static const u8 *dedup_property(const u8 *set, u32 set_size, le32 magic,
 	u32 offset;
 	u32 count;
 
+	*pvalue = (const u8*)NULL;
+	*psize = 0;
 	head = (const DEDUP_PROPERTY_SET*)set;
 	if (set_size < sizeof(DEDUP_PROPERTY_SET))
 		goto bad;
@@ -330,20 +365,62 @@ static const u8 *dedup_property(const u8 *set, u32 set_size, le32 magic,
 	    || (count > ((size - sizeof(DEDUP_PROPERTY_SET))
 				/ sizeof(DEDUP_PROPERTY))))
 		goto bad;
-	if (index >= (int)count)
-		goto bad;
+	if (index >= (int)count) {
+		if (required)
+			goto bad;
+		return (0);
+	}
 	prop = (const DEDUP_PROPERTY*)&set[sizeof(DEDUP_PROPERTY_SET)];
 	prop += index;
+		/* an absent property has a null type and size */
+	if (!prop->size && (!prop->type || (prop->type == cpu_to_le16(type)))) {
+		if (required)
+			goto bad;
+		return (0);
+	}
 	offset = le32_to_cpu(prop->offset);
 	if ((le16_to_cpu(prop->type) != type)
 	    || (offset > size)
 	    || (le16_to_cpu(prop->size) > (size - offset)))
 		goto bad;
 	*psize = le16_to_cpu(prop->size);
-	return (&set[offset]);
+	*pvalue = &set[offset];
+	return (0);
 bad :
-	dedup_corrupt("reparse property");
-	return ((const u8*)NULL);
+	return (dedup_corrupt("reparse property"));
+}
+
+static const u8 *dedup_property(const u8 *set, u32 set_size, le32 magic,
+			int index, int type, u32 *psize)
+{
+	const u8 *value;
+
+	if (dedup_get_property(set, set_size, magic, index, type,
+			&value, psize, TRUE))
+		value = (const u8*)NULL;
+	return (value);
+}
+
+/*
+ *		Get an optional 32-bit property, zero if absent
+ */
+
+static int dedup_property_u32(const u8 *set, u32 set_size, le32 magic,
+			int index, u32 *pvalue)
+{
+	const u8 *value;
+	u32 size;
+
+	*pvalue = 0;
+	if (dedup_get_property(set, set_size, magic, index,
+			DEDUP_PROPERTY_FLAGS, &value, &size, FALSE))
+		return (-1);
+	if (value) {
+		if (size != sizeof(le32))
+			return (dedup_corrupt("reparse property"));
+		*pvalue = le32_to_cpup((const le32*)value);
+	}
+	return (0);
 }
 
 static BOOL dedup_property_version(const u8 *set, u32 set_size, le32 magic,
@@ -411,18 +488,120 @@ static int dedup_set_parts(ntfs_dedup *dd, const u8 *entries, int count)
 }
 
 /*
+ *		Get the maximum size of a file tracked by a recall bitmap
+ */
+
+static u64 dedup_bitmap_capacity(u32 depth, u32 shift)
+{
+	u64 units;
+
+	units = DEDUP_RKBM_LEAF_ENTRIES;
+	while (depth--)
+		units *= DEDUP_RKBM_NODE_ENTRIES;
+	return (units << shift);
+}
+
+/*
+ *		Parse the recall state of a file (RbRp property set)
+ *
+ *	The size of a file which has been partially recalled is the size
+ *	of its data stream, as it may have been changed by Windows.
+ */
+
+static int dedup_parse_recall(ntfs_dedup *dd, ntfs_inode *ni,
+			const u8 *rbrp, u32 rbrp_size, u32 bitmap_type)
+{
+	struct DEDUP_RECALL *recall;
+	const u8 *bitmap;
+	const u8 *value;
+	u32 bitmap_size;
+	u32 value_size;
+	u32 flat_unit;
+	u32 depth;
+	u32 shift;
+
+	recall = &dd->recall;
+	if (!dedup_property_version(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+					DEDUP_RBRP_VERSION))
+		return (dedup_corrupt("recall properties"));
+	if (dedup_get_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+			DEDUP_RBRP_BITMAP, DEDUP_PROPERTY_BLOB,
+			&bitmap, &bitmap_size, FALSE))
+		return (-1);
+	if (!bitmap)
+		return (0);	/* nothing recalled */
+	if (bitmap_type != DEDUP_BITMAP_NORMAL) {
+		ntfs_log_error("Unsupported deduplication recall bitmap"
+				" type %lu in inode %lld\n",
+				(unsigned long)bitmap_type,
+				(long long)ni->mft_no);
+		errno = EOPNOTSUPP;
+		return (-1);
+	}
+	if (dedup_property_u32(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+				DEDUP_RBRP_RECALL_SHIFT, &shift)
+	    || dedup_property_u32(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+				DEDUP_RBRP_BITMAP_DEPTH, &depth)
+	    || dedup_property_u32(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+				DEDUP_RBRP_FLAT_UNIT, &flat_unit))
+		return (-1);
+	if (!shift)
+		shift = DEDUP_DEFAULT_RECALL_SHIFT;
+	value = dedup_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+			DEDUP_RBRP_STREAM_ID, DEDUP_PROPERTY_U64, &value_size);
+	if (!value || (value_size != sizeof(le64)))
+		return (dedup_corrupt("recall stream id"));
+	recall->stream_sequence = le32_to_cpup((const le32*)value);
+	recall->stream_container_id = le32_to_cpup((const le32*)&value[4]);
+	value = dedup_property(rbrp, rbrp_size, DEDUP_RBRP_MAGIC,
+			DEDUP_RBRP_FILE_GUID, DEDUP_PROPERTY_GUID, &value_size);
+	if (!value || (value_size != sizeof(GUID)))
+		return (dedup_corrupt("recall file guid"));
+	memcpy(&recall->file_guid, value, sizeof(GUID));
+	if ((shift < 9) || (shift > 30))
+		return (dedup_corrupt("recall unit"));
+	recall->shift = shift;
+	recall->tracked = dd->size;
+	if (flat_unit) {
+		recall->kind = DEDUP_RECALL_FLAT;
+		recall->flat_unit = (u64)flat_unit << 16;
+	} else {
+		if ((bitmap_size != DEDUP_RKBM_PAGE_SIZE)
+		    || (depth > DEDUP_MAX_BITMAP_DEPTH)
+		    || (dedup_bitmap_capacity(depth, shift) < dd->size))
+			return (dedup_corrupt("recall bitmap"));
+		recall->kind = DEDUP_RECALL_TREE;
+		recall->depth = depth;
+		recall->page_offset[0] = -1;
+		recall->page_offset[1] = -1;
+	}
+	recall->bitmap = (u8*)ntfs_malloc(bitmap_size);
+	if (!recall->bitmap)
+		return (-1);
+	memcpy(recall->bitmap, bitmap, bitmap_size);
+	recall->bitmap_size = bitmap_size;
+		/* Windows may have resized the file */
+	dd->size = ni->data_size;
+	return (0);
+}
+
+/*
  *		Parse the reparse data made of property sets
  *
  *	The data is made of a FeRp property set describing the file,
  *	which contains a DdRp property set designating the stream maps.
  */
 
-static int dedup_parse_properties(ntfs_dedup *dd, const u8 *data, u32 size)
+static int dedup_parse_properties(ntfs_dedup *dd, ntfs_inode *ni,
+			const u8 *data, u32 size)
 {
 	const u8 *ddrp;
+	const u8 *rbrp;
 	const u8 *value;
 	u32 ddrp_size;
+	u32 rbrp_size;
 	u32 value_size;
+	u32 bitmap_type;
 
 	if (!dedup_property_version(data, size, DEDUP_FERP_MAGIC,
 					DEDUP_FERP_VERSION))
@@ -448,8 +627,18 @@ static int dedup_parse_properties(ntfs_dedup *dd, const u8 *data, u32 size)
 			DEDUP_DDRP_STREAMS, DEDUP_PROPERTY_BLOB, &value_size);
 	if (!value || !value_size || (value_size % DEDUP_STREAM_ENTRY_SIZE))
 		return (dedup_corrupt("stream entries"));
-	return (dedup_set_parts(dd, value,
-			value_size / DEDUP_STREAM_ENTRY_SIZE));
+	if (dedup_set_parts(dd, value, value_size / DEDUP_STREAM_ENTRY_SIZE))
+		return (-1);
+	if (dedup_property_u32(data, size, DEDUP_FERP_MAGIC,
+				DEDUP_FERP_BITMAP_TYPE, &bitmap_type))
+		return (-1);
+	if (dedup_get_property(data, size, DEDUP_FERP_MAGIC, DEDUP_FERP_RBRP,
+			DEDUP_PROPERTY_BLOB, &rbrp, &rbrp_size, FALSE))
+		return (-1);
+	if (rbrp)
+		return (dedup_parse_recall(dd, ni, rbrp, rbrp_size,
+				bitmap_type));
+	return (0);
 }
 
 /*
@@ -550,7 +739,7 @@ ntfs_dedup *ntfs_dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse)
 	format = le16_to_cpup((const le16*)data);
 	switch (format) {
 	case DEDUP_FORMAT_PROPERTIES :
-		res = dedup_parse_properties(dd, &data[4], size - 8);
+		res = dedup_parse_properties(dd, ni, &data[4], size - 8);
 		break;
 	case DEDUP_FORMAT_LONG :
 		res = dedup_parse_long(dd, data, size - 4);
@@ -592,6 +781,9 @@ void ntfs_dedup_close(ntfs_dedup *dd)
 {
 	if (dd) {
 		dedup_drop_containers(dd);
+		free(dd->recall.bitmap);
+		free(dd->recall.page[0]);
+		free(dd->recall.page[1]);
 		free(dd->parts);
 		free(dd->smap);
 		free(dd->chunk);
@@ -1207,6 +1399,192 @@ static int dedup_seek_chunk(ntfs_dedup *dd, u64 pos)
 }
 
 /*
+ *		Check a recall bitmap page
+ */
+
+static BOOL dedup_valid_page(const u8 *page)
+{
+	return (dedup_crc32(page, DEDUP_RKBM_PAGE_DATA)
+		== le32_to_cpup((const le32*)&page[DEDUP_RKBM_PAGE_DATA]));
+}
+
+/*
+ *		Read a page from a level file of the recall bitmap
+ *
+ *	The level file is checked when it is first opened, and the last
+ *	page read from each level is kept.
+ *
+ *	Returns the page, or NULL if it could not be read
+ */
+
+static const u8 *dedup_recall_page(ntfs_dedup *dd, u32 level, s64 offset)
+{
+	struct DEDUP_RECALL *recall;
+	char path[DEDUP_MAX_PATH + 40];
+	const DEDUP_RKBM_HEADER *head;
+	ntfs_inode *ni;
+	ntfs_attr *na;
+	u8 *page;
+	BOOL ok;
+	int i;
+
+	recall = &dd->recall;
+	if (recall->page_offset[level] == offset)
+		return (recall->page[level]);
+	if (!recall->page[level]) {
+		recall->page[level] = (u8*)ntfs_malloc(DEDUP_RKBM_PAGE_SIZE);
+		if (!recall->page[level])
+			return ((const u8*)NULL);
+	}
+	page = recall->page[level];
+	recall->page_offset[level] = -1;
+	if (recall->level_mref[level])
+		ni = ntfs_inode_open(dd->vol, recall->level_mref[level]);
+	else {
+		snprintf(path, sizeof(path), "%s/COW/%08lx/%08lx.%02lx.RB",
+				dd->store_path,
+				(long)recall->stream_container_id,
+				(long)recall->stream_sequence, (long)level);
+		ni = ntfs_pathname_to_inode(dd->vol, (ntfs_inode*)NULL, path);
+		if (!ni) {
+			ntfs_log_perror("Could not open recall bitmap %s",
+					path);
+			errno = EIO;
+			return ((const u8*)NULL);
+		}
+	}
+	if (!ni)
+		return ((const u8*)NULL);
+	na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+	ok = FALSE;
+	if (na) {
+		if (!recall->level_mref[level]) {
+			/* one of the two header slots must match */
+			head = (const DEDUP_RKBM_HEADER*)page;
+			for (i=0; (i<2) && !ok; i++)
+				ok = !dedup_pread(na, i*DEDUP_RKBM_PAGE_SIZE,
+						DEDUP_RKBM_PAGE_SIZE, page)
+				    && dedup_valid_page(page)
+				    && (head->common.magic == DEDUP_RKBM_MAGIC)
+				    && (le32_to_cpu(head->level) == level)
+				    && (le32_to_cpu(head->stream_sequence)
+					== recall->stream_sequence)
+				    && (le32_to_cpu(head->stream_container_id)
+					== recall->stream_container_id)
+				    && !memcmp(&head->file_guid,
+					&recall->file_guid, sizeof(GUID));
+			if (ok)
+				recall->level_mref[level] = MK_MREF(ni->mft_no,
+					le16_to_cpu(ni->mrec->sequence_number));
+		} else
+			ok = TRUE;
+		ok = ok && !dedup_pread(na, offset, DEDUP_RKBM_PAGE_SIZE, page)
+			&& dedup_valid_page(page);
+		ntfs_attr_close(na);
+	}
+	ntfs_inode_close(ni);
+	if (!ok) {
+		dedup_corrupt("recall bitmap page");
+		return ((const u8*)NULL);
+	}
+	recall->page_offset[level] = offset;
+	return (page);
+}
+
+/*
+ *		Tell whether a file position is in a recalled range
+ *
+ *	The tree is walked from its root, until an entry tells that the
+ *	whole range is or is not recalled, or a leaf bit is reached.
+ *	The end of the range in the same state is returned.
+ *
+ *	Returns 1 if recalled, 0 if not, or -1 if there is an error
+ */
+
+static int dedup_recall_query(ntfs_dedup *dd, u64 pos, u64 *pend)
+{
+	struct DEDUP_RECALL *recall;
+	const u8 *page;
+	u64 granularity;
+	u64 entry;
+	u64 block;
+	u64 index;
+	u64 limit;
+	u32 level;
+	int state;
+	int bit;
+
+	recall = &dd->recall;
+	if (recall->kind == DEDUP_RECALL_FLAT) {
+		index = pos / recall->flat_unit;
+		limit = (u64)recall->bitmap_size * 8;
+		if (index >= limit) {
+			*pend = recall->tracked;
+			return (0);
+		}
+		bit = (recall->bitmap[index >> 3] >> (index & 7)) & 1;
+		while ((++index < limit)
+		    && (((recall->bitmap[index >> 3] >> (index & 7)) & 1)
+				== bit)) { }
+		*pend = index * recall->flat_unit;
+		return (bit);
+	}
+	page = recall->bitmap;
+	level = recall->depth;
+	block = 0;
+	while (level) {
+		granularity = dedup_bitmap_capacity(level - 1, recall->shift);
+		entry = pos / granularity;
+		index = entry - block*DEDUP_RKBM_NODE_ENTRIES;
+		if (index >= DEDUP_RKBM_NODE_ENTRIES)
+			return (dedup_corrupt("recall bitmap entry"));
+		state = (page[index >> 2] >> ((index & 3) << 1)) & 3;
+		if ((state == 0) || (state == 3)) {
+			*pend = (entry + 1)*granularity;
+			return (state == 3);
+		}
+			/* the child block has two slots */
+		level--;
+		block = entry;
+		page = dedup_recall_page(dd, level, DEDUP_RKBM_FIRST_BLOCK
+				+ block*DEDUP_RKBM_BLOCK_SIZE
+				+ (state == 2 ? DEDUP_RKBM_PAGE_SIZE : 0));
+		if (!page)
+			return (-1);
+	}
+	entry = pos >> recall->shift;
+	index = entry - block*DEDUP_RKBM_LEAF_ENTRIES;
+	if (index >= DEDUP_RKBM_LEAF_ENTRIES)
+		return (dedup_corrupt("recall bitmap entry"));
+	bit = (page[index >> 3] >> (index & 7)) & 1;
+	while ((++index < DEDUP_RKBM_LEAF_ENTRIES)
+	    && (((page[index >> 3] >> (index & 7)) & 1) == bit)) { }
+	*pend = (block*DEDUP_RKBM_LEAF_ENTRIES + index) << recall->shift;
+	return (bit);
+}
+
+/*
+ *		Read from the data stream of a partially recalled file
+ */
+
+static s64 dedup_pread_recalled(ntfs_inode *ni, s64 pos, s64 count, void *b)
+{
+	ntfs_attr *na;
+	s64 got;
+
+	na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+	if (!na)
+		return (-1);
+	got = ntfs_attr_pread(na, pos, count, b);
+	ntfs_attr_close(na);
+	if ((got >= 0) && (got != count)) {
+		dedup_corrupt("recalled data");
+		got = -1;
+	}
+	return (got);
+}
+
+/*
  *		Read from a deduplicated file
  *
  *	Returns the number of bytes read, which is less than requested
@@ -1214,13 +1592,16 @@ static int dedup_seek_chunk(ntfs_dedup *dd, u64 pos)
  *		or -1 with errno set if nothing could be read.
  */
 
-s64 ntfs_dedup_pread(ntfs_dedup *dd, s64 pos, s64 count, void *b)
+s64 ntfs_dedup_pread(ntfs_dedup *dd, ntfs_inode *ni, s64 pos, s64 count,
+			void *b)
 {
 	s64 total;
 	s64 n;
 	u64 cur;
+	u64 end;
+	int recalled;
 
-	if (!dd || (pos < 0) || (count < 0) || !b) {
+	if (!dd || !ni || (pos < 0) || (count < 0) || !b) {
 		errno = EINVAL;
 		return (-1);
 	}
@@ -1231,12 +1612,34 @@ s64 ntfs_dedup_pread(ntfs_dedup *dd, s64 pos, s64 count, void *b)
 	total = 0;
 	while (total < count) {
 		cur = pos + total;
-		if (dedup_seek_chunk(dd, cur))
-			return (total ? total : -1);
-		n = dd->chunk_end - cur;
+		end = dd->size;
+		recalled = 0;
+		if (dd->recall.kind != DEDUP_RECALL_NONE) {
+			if (cur >= dd->recall.tracked)
+				recalled = 1;
+			else {
+				recalled = dedup_recall_query(dd, cur, &end);
+				if (recalled < 0)
+					return (total ? total : -1);
+				if (end > dd->recall.tracked)
+					end = dd->recall.tracked;
+			}
+		}
+		n = end - cur;
 		if (n > (count - total))
 			n = count - total;
-		memcpy((char*)b + total, &dd->chunk[cur - dd->chunk_begin], n);
+		if (recalled) {
+			if (dedup_pread_recalled(ni, cur, n,
+					(char*)b + total) < 0)
+				return (total ? total : -1);
+		} else {
+			if (dedup_seek_chunk(dd, cur))
+				return (total ? total : -1);
+			if (n > (s64)(dd->chunk_end - cur))
+				n = dd->chunk_end - cur;
+			memcpy((char*)b + total,
+				&dd->chunk[cur - dd->chunk_begin], n);
+		}
 		total += n;
 	}
 	return (total);

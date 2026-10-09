@@ -1000,7 +1000,7 @@ static int dedup_release(ntfs_inode *ni __attribute__((unused)),
 	return (0);
 }
 
-static int dedup_read(ntfs_inode *ni __attribute__((unused)),
+static int dedup_read(ntfs_inode *ni,
 			const REPARSE_POINT *reparse __attribute__((unused)),
 			char *buf, size_t size, off_t offset,
 			struct fuse_file_info *fi)
@@ -1011,7 +1011,7 @@ static int dedup_read(ntfs_inode *ni __attribute__((unused)),
 	dd = (ntfs_dedup*)(long)fi->fh;
 	if (!dd)
 		return (-EINVAL);
-	res = ntfs_dedup_pread(dd, offset, size, buf);
+	res = ntfs_dedup_pread(dd, ni, offset, size, buf);
 	return (res < 0 ? -errno : (int)res);
 }
 
