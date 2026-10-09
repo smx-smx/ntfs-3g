@@ -951,8 +951,6 @@ const struct plugin_operations *select_reparse_plugin(ntfs_fuse_context_t *ctx,
 /*
  *		Get the attributes of a deduplicated file
  *		(internal plugin)
- *
- *	Writing is not supported, so the file is shown as read-only.
  */
 
 static int dedup_getattr(ntfs_inode *ni, const REPARSE_POINT *reparse,
@@ -965,16 +963,21 @@ static int dedup_getattr(ntfs_inode *ni, const REPARSE_POINT *reparse,
 		return (-errno);
 	stbuf->st_size = ntfs_dedup_size(dd);
 	stbuf->st_blocks = (stbuf->st_size + 511) >> 9;
-	stbuf->st_mode = S_IFREG | 0555;
+	stbuf->st_mode = S_IFREG | 0777;
 	ntfs_dedup_close(dd);
 	return (0);
 }
 
 /*
- *		Open a deduplicated file for reading
+ *		Open a deduplicated file
  *		(internal plugin)
  *
- *	The reading context is kept in fi->fh until the file is released.
+ *	When opening for reading only, a reading context is kept in fi->fh
+ *	until the file is released.
+ *
+ *	When opening for writing, the file is only restored when it is
+ *	written to or truncated, so that it is not uselessly restored when
+ *	it is being overwritten.
  */
 
 static int dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse,
@@ -982,12 +985,13 @@ static int dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse,
 {
 	ntfs_dedup *dd;
 
-	if ((fi->flags & O_ACCMODE) != O_RDONLY)
-		return (-EOPNOTSUPP);
 	dd = ntfs_dedup_open(ni, reparse);
 	if (!dd)
 		return (-errno);
-	fi->fh = (long)dd;
+	if ((fi->flags & O_ACCMODE) == O_RDONLY)
+		fi->fh = (long)dd;
+	else
+		ntfs_dedup_close(dd);
 	return (0);
 }
 
@@ -1000,8 +1004,7 @@ static int dedup_release(ntfs_inode *ni __attribute__((unused)),
 	return (0);
 }
 
-static int dedup_read(ntfs_inode *ni,
-			const REPARSE_POINT *reparse __attribute__((unused)),
+static int dedup_read(ntfs_inode *ni, const REPARSE_POINT *reparse,
 			char *buf, size_t size, off_t offset,
 			struct fuse_file_info *fi)
 {
@@ -1009,10 +1012,63 @@ static int dedup_read(ntfs_inode *ni,
 	s64 res;
 
 	dd = (ntfs_dedup*)(long)fi->fh;
-	if (!dd)
-		return (-EINVAL);
-	res = ntfs_dedup_pread(dd, ni, offset, size, buf);
+	if (dd)
+		res = ntfs_dedup_pread(dd, ni, offset, size, buf);
+	else {
+		/* opened for writing, no reading context */
+		dd = ntfs_dedup_open(ni, reparse);
+		if (!dd)
+			return (-errno);
+		res = ntfs_dedup_pread(dd, ni, offset, size, buf);
+		ntfs_dedup_close(dd);
+	}
 	return (res < 0 ? -errno : (int)res);
+}
+
+/*
+ *		Write to a deduplicated file
+ *		(internal plugin)
+ *
+ *	The file is first restored as a plain file, then written to.
+ */
+
+static int dedup_write(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			const char *buf, size_t size, off_t offset,
+			struct fuse_file_info *fi __attribute__((unused)))
+{
+	ntfs_attr *na;
+	s64 total;
+	s64 ret;
+
+	if (ntfs_dedup_rehydrate(ni, reparse, -1))
+		return (-errno);
+	na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
+	if (!na)
+		return (-errno);
+	total = 0;
+	while (total < (s64)size) {
+		ret = ntfs_attr_pwrite(na, offset + total, size - total,
+				buf + total);
+		if (ret <= 0)
+			break;
+		total += ret;
+	}
+	ntfs_attr_close(na);
+	return (total ? (int)total : -(errno ? errno : EIO));
+}
+
+/*
+ *		Truncate a deduplicated file
+ *		(internal plugin)
+ *
+ *	The file is restored as a plain file of the requested size, only
+ *	the kept part of the content has to be copied.
+ */
+
+static int dedup_truncate(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			off_t size)
+{
+	return (ntfs_dedup_rehydrate(ni, reparse, size) ? -errno : 0);
 }
 
 const plugin_operations_t dedup_plugin_ops = {
@@ -1020,6 +1076,8 @@ const plugin_operations_t dedup_plugin_ops = {
 	.open = dedup_open,
 	.release = dedup_release,
 	.read = dedup_read,
+	.write = dedup_write,
+	.truncate = dedup_truncate,
 } ;
 
 void close_reparse_plugins(ntfs_fuse_context_t *ctx)
