@@ -25,6 +25,7 @@ libntfs_3g_la_SOURCES =	\
 	compat.c 	\
 	compress.c 	\
 	debug.c 	\
+	decompress.c 	\
 	device.c 	\
 	dir.c 		\
 	ea.c 		\

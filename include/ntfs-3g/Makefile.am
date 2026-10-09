@@ -12,6 +12,7 @@ headers = \
 	compat.h	\
 	compress.h	\
 	debug.h		\
+	decompress.h	\
 	device.h	\
 	device_io.h	\
 	dir.h		\
