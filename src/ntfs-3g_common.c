@@ -53,6 +53,7 @@
 #include "security.h"
 #include "xattrs.h"
 #include "reparse.h"
+#include "dedup.h"
 #include "plugin.h"
 #include "ntfs-3g_common.h"
 #include "realpath.h"
@@ -946,6 +947,80 @@ const struct plugin_operations *select_reparse_plugin(ntfs_fuse_context_t *ctx,
 	}
 	return (ops);
 }
+
+/*
+ *		Get the attributes of a deduplicated file
+ *		(internal plugin)
+ *
+ *	Writing is not supported, so the file is shown as read-only.
+ */
+
+static int dedup_getattr(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			struct stat *stbuf)
+{
+	ntfs_dedup *dd;
+
+	dd = ntfs_dedup_open(ni, reparse);
+	if (!dd)
+		return (-errno);
+	stbuf->st_size = ntfs_dedup_size(dd);
+	stbuf->st_blocks = (stbuf->st_size + 511) >> 9;
+	stbuf->st_mode = S_IFREG | 0555;
+	ntfs_dedup_close(dd);
+	return (0);
+}
+
+/*
+ *		Open a deduplicated file for reading
+ *		(internal plugin)
+ *
+ *	The reading context is kept in fi->fh until the file is released.
+ */
+
+static int dedup_open(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			struct fuse_file_info *fi)
+{
+	ntfs_dedup *dd;
+
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return (-EOPNOTSUPP);
+	dd = ntfs_dedup_open(ni, reparse);
+	if (!dd)
+		return (-errno);
+	fi->fh = (long)dd;
+	return (0);
+}
+
+static int dedup_release(ntfs_inode *ni __attribute__((unused)),
+			const REPARSE_POINT *reparse __attribute__((unused)),
+			struct fuse_file_info *fi)
+{
+	ntfs_dedup_close((ntfs_dedup*)(long)fi->fh);
+	fi->fh = 0;
+	return (0);
+}
+
+static int dedup_read(ntfs_inode *ni __attribute__((unused)),
+			const REPARSE_POINT *reparse __attribute__((unused)),
+			char *buf, size_t size, off_t offset,
+			struct fuse_file_info *fi)
+{
+	ntfs_dedup *dd;
+	s64 res;
+
+	dd = (ntfs_dedup*)(long)fi->fh;
+	if (!dd)
+		return (-EINVAL);
+	res = ntfs_dedup_pread(dd, offset, size, buf);
+	return (res < 0 ? -errno : (int)res);
+}
+
+const plugin_operations_t dedup_plugin_ops = {
+	.getattr = dedup_getattr,
+	.open = dedup_open,
+	.release = dedup_release,
+	.read = dedup_read,
+} ;
 
 void close_reparse_plugins(ntfs_fuse_context_t *ctx)
 {

@@ -3900,6 +3900,8 @@ static void register_internal_reparse_plugins(void)
 					&wsl_ops, (void*)NULL);
 	register_reparse_plugin(ctx, IO_REPARSE_TAG_LX_BLK,
 					&wsl_ops, (void*)NULL);
+	register_reparse_plugin(ctx, IO_REPARSE_TAG_DEDUP,
+					&dedup_plugin_ops, (void*)NULL);
 }
 #endif /* DISABLE_PLUGINS */
 
