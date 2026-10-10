@@ -329,7 +329,7 @@ static int ntfs_w32error_to_errno(unsigned int w32error)
 
 static int ntfs_ntstatus_to_errno(NTSTATUS status)
 {
-	ntfs_log_trace("Converting w32error 0x%x.\n",w32error);
+	ntfs_log_trace("Converting NTSTATUS 0x%x.\n", (unsigned int)status);
 	switch (status) {
 		case STATUS_INVALID_HANDLE :
 		case STATUS_INVALID_PARAMETER :
@@ -1331,7 +1331,7 @@ static s64 ntfs_device_win32_pio(win32_fd *fd, const s64 pos,
 	s64 bytes;
 
 	ntfs_log_trace("pos = 0x%llx, count = 0x%llx, direction = %s.\n",
-			(long long)pos, (long long)count, write ? "write" :
+			(long long)pos, (long long)count, wbuf ? "write" :
 			"read");
 	li.QuadPart = pos;
 	if (fd->vol_handle != INVALID_HANDLE_VALUE && pos < fd->geo_size) {
@@ -1381,7 +1381,7 @@ static s64 ntfs_device_win32_pio(win32_fd *fd, const s64 pos,
 		bytes = bt;
 		if (!res) {
 			errno = ntfs_w32error_to_errno(GetLastError());
-			ntfs_log_trace("%sFile() failed.\n", write ?
+			ntfs_log_trace("%sFile() failed.\n", wbuf ?
 							"Write" : "Read");
 			return -1;
 		}
