@@ -27,9 +27,8 @@
 #include "config.h"
 
 #ifdef HAVE_WINDOWS_H
-#define BOOL WINBOOL /* avoid conflicting definitions of BOOL */
+#define BOOL MYBOOL /* avoid conflicting definitions of BOOL */
 #include <windows.h>
-#undef BOOL
 #endif
 
 #ifdef HAVE_STDLIB_H
@@ -44,15 +43,6 @@
 #define _ANONYMOUS_STRUCT
 typedef unsigned long long DWORD64;
 #endif
-
-typedef struct {
-        DWORD data1;     /* The first eight hexadecimal digits of the GUID. */
-        WORD data2;     /* The first group of four hexadecimal digits. */
-        WORD data3;     /* The second group of four hexadecimal digits. */ 
-        char data4[8];    /* The first two bytes are the third group of four
-                           hexadecimal digits. The remaining six bytes are the
-                           final 12 hexadecimal digits. */
-} GUID;
 
 #include <winioctl.h>
 
@@ -70,12 +60,15 @@ typedef struct {
 #endif
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
+#ifndef __CYGWIN__
 #define stat stat64
+#endif
 #define st_blocks  st_rdev /* emulate st_blocks, missing in Windows */
 #endif
 
 /* Prevent volume.h from being be loaded, as it conflicts with winnt.h. */
 #define _NTFS_VOLUME_H
+struct ntfs_device;
 struct ntfs_volume;
 typedef struct ntfs_volume ntfs_volume;
 
@@ -138,8 +131,6 @@ enum { /* see http://msdn.microsoft.com/en-us/library/cc704588(v=prot.10).aspx *
    STATUS_UNKNOWN = -1,
    STATUS_SUCCESS =              0x00000000,
    STATUS_BUFFER_OVERFLOW =      0x80000005,
-   STATUS_INVALID_HANDLE =       0xC0000008,
-   STATUS_INVALID_PARAMETER =    0xC000000D,
    STATUS_INVALID_DEVICE_REQUEST = 0xC0000010,
    STATUS_END_OF_FILE =          0xC0000011,
    STATUS_CONFLICTING_ADDRESSES = 0xC0000018,
@@ -152,18 +143,10 @@ enum { /* see http://msdn.microsoft.com/en-us/library/cc704588(v=prot.10).aspx *
    STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034,
    STATUS_SHARING_VIOLATION =    0xC0000043,
    STATUS_INVALID_PARAMETER_1 =  0xC00000EF,
-   STATUS_IO_DEVICE_ERROR =      0xC0000185,
-   STATUS_GUARD_PAGE_VIOLATION = 0x80000001
+   STATUS_IO_DEVICE_ERROR =      0xC0000185
  } ;
 
-typedef u32 NTSTATUS; /* do not let the compiler choose the size */
-#ifdef __x86_64__
-typedef unsigned long long ULONG_PTR; /* an integer the same size as a pointer */
-#else
-typedef unsigned long ULONG_PTR; /* an integer the same size as a pointer */
-#endif
-
-HANDLE get_osfhandle(int); /* from msvcrt.dll */
+HANDLE _get_osfhandle(int); /* from msvcrt.dll */
 
 /*
  *		A few needed definitions not included in <windows.h>
@@ -203,11 +186,6 @@ typedef struct _OBJECT_ATTRIBUTES {
 	PVOID           SecurityQualityOfService;
 }  OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
-#define FILE_OPEN 1
-#define FILE_CREATE 2
-#define FILE_OVERWRITE 4
-#define FILE_SYNCHRONOUS_IO_ALERT    0x10
-#define FILE_SYNCHRONOUS_IO_NONALERT 0x20
 #define OBJ_CASE_INSENSITIVE 0x40
 
 typedef void (WINAPI *PIO_APC_ROUTINE)(void*, PIO_STATUS_BLOCK, ULONG);
@@ -303,7 +281,11 @@ static int ntfs_w32error_to_errno(unsigned int w32error)
 	ntfs_log_trace("Converting w32error 0x%x.\n",w32error);
 	switch (w32error) {
 		case ERROR_INVALID_FUNCTION:
+#ifdef EBADRQC
 			return EBADRQC;
+#else
+			return EINVAL;
+#endif
 		case ERROR_FILE_NOT_FOUND:
 		case ERROR_PATH_NOT_FOUND:
 		case ERROR_INVALID_NAME:
@@ -334,7 +316,11 @@ static int ntfs_w32error_to_errno(unsigned int w32error)
 		case ERROR_NOT_SUPPORTED:
 			return EOPNOTSUPP;
 		case ERROR_BAD_NETPATH:
+#ifdef ENOSHARE
 			return ENOSHARE;
+#else
+			return ENOENT;
+#endif
 		default:
 			/* generic message */
 			return ENOMSG;
@@ -1461,7 +1447,7 @@ static s64 ntfs_device_win32_read(struct ntfs_device *dev, void *b, s64 count)
 			"ofs = %i, to_read = 0x%llx.\n", fd, b,
 			(long long)count, (long long)old_pos, ofs,
 			(long long)to_read);
-	if (!((unsigned long)b & (fd->geo_sector_size - 1)) && !old_ofs &&
+	if (!((ULONG_PTR)b & (fd->geo_sector_size - 1)) && !old_ofs &&
 			!(count & (fd->geo_sector_size - 1)))
 		alignedbuffer = b;
 	else {
@@ -1666,7 +1652,7 @@ static s64 ntfs_device_win32_write(struct ntfs_device *dev, const void *b,
 		return 0;
 	NDevSetDirty(dev);
 	readbuffer = (BYTE*)NULL;
-	if (!((unsigned long)b & (fd->geo_sector_size - 1)) && !old_ofs &&
+	if (!((ULONG_PTR)b & (fd->geo_sector_size - 1)) && !old_ofs &&
 			!(count & (fd->geo_sector_size - 1)))
 		alignedbuffer = (const BYTE *)b;
 	else {
@@ -1972,7 +1958,7 @@ int ntfs_win32_set_sparse(int fd)
 	HANDLE handle;
 	DWORD bytes;   
 
-	handle = get_osfhandle(fd);
+	handle = _get_osfhandle(fd);
 	if (handle == INVALID_HANDLE_VALUE)
 		ok = FALSE;
 	else
@@ -2036,7 +2022,7 @@ int ntfs_win32_ftruncate(int fd, s64 size)
 	int ret;
 	HANDLE handle;
 
-	handle = get_osfhandle(fd);
+	handle = _get_osfhandle(fd);
 	ret = win32_ftruncate(handle, size);
 	return (ret);
 }
