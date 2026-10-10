@@ -74,6 +74,10 @@ struct ntfs_logging {
 	ntfs_log_handler *handler BROKEN_GCC_FORMAT_ATTRIBUTE;
 };
 
+#define NTFS_LOG_LEVEL_DEFAULT (NTFS_LOG_LEVEL_INFO | NTFS_LOG_LEVEL_QUIET \
+	| NTFS_LOG_LEVEL_WARNING | NTFS_LOG_LEVEL_ERROR | NTFS_LOG_LEVEL_PERROR \
+	| NTFS_LOG_LEVEL_CRITICAL | NTFS_LOG_LEVEL_PROGRESS)
+
 /**
  * ntfs_log
  * This struct controls all the logging within the library and tools.
@@ -83,9 +87,7 @@ static struct ntfs_logging ntfs_log = {
 	NTFS_LOG_LEVEL_DEBUG | NTFS_LOG_LEVEL_TRACE | NTFS_LOG_LEVEL_ENTER |
 	NTFS_LOG_LEVEL_LEAVE |
 #endif
-	NTFS_LOG_LEVEL_INFO | NTFS_LOG_LEVEL_QUIET | NTFS_LOG_LEVEL_WARNING |
-	NTFS_LOG_LEVEL_ERROR | NTFS_LOG_LEVEL_PERROR | NTFS_LOG_LEVEL_CRITICAL |
-	NTFS_LOG_LEVEL_PROGRESS,
+	NTFS_LOG_LEVEL_DEFAULT,
 	NTFS_LOG_FLAG_ONLYNAME,
 #ifdef DEBUG
 	ntfs_log_handler_outerr
@@ -602,13 +604,39 @@ int ntfs_log_handler_stderr(const char *function, const char *file,
 }
 
 
+/*
+ *	The logging options, each one enabling or disabling some levels
+ */
+static const struct {
+	const char *name;
+	u32 levels;
+	BOOL clear;
+} ntfs_log_options[] = {
+	{ "--log-none",     ~(u32)0,                 TRUE },
+	{ "--log-default",  NTFS_LOG_LEVEL_DEFAULT,  FALSE },
+	{ "--log-quiet",    NTFS_LOG_LEVEL_QUIET,    TRUE },
+	{ "--log-debug",    NTFS_LOG_LEVEL_DEBUG,    FALSE },
+	{ "--log-trace",    NTFS_LOG_LEVEL_TRACE,    FALSE },
+	{ "--log-enter",    NTFS_LOG_LEVEL_ENTER,    FALSE },
+	{ "--log-leave",    NTFS_LOG_LEVEL_LEAVE,    FALSE },
+	{ "--log-verbose",  NTFS_LOG_LEVEL_VERBOSE,  FALSE },
+	{ "--log-info",     NTFS_LOG_LEVEL_INFO,     FALSE },
+	{ "--log-warning",  NTFS_LOG_LEVEL_WARNING,  FALSE },
+	{ "--log-error",    NTFS_LOG_LEVEL_ERROR,    FALSE },
+	{ "--log-perror",   NTFS_LOG_LEVEL_PERROR,   FALSE },
+	{ "--log-critical", NTFS_LOG_LEVEL_CRITICAL, FALSE },
+	{ "--log-progress", NTFS_LOG_LEVEL_PROGRESS, FALSE },
+} ;
+
 /**
  * ntfs_log_parse_option - Act upon command line options
  * @option:	Option flag
  *
  * Delegate some of the work of parsing the command line.  All the options begin
  * with "--log-".  Options cause log levels to be enabled in @ntfs_log (the
- * global logging structure).
+ * global logging structure), except "--log-quiet" which disables the output
+ * which can be quieted and "--log-none" which disables all the levels, so that
+ * only the levels requested by the next options are enabled.
  *
  * Note: The "colour" option changes the logging handler.
  *
@@ -617,20 +645,17 @@ int ntfs_log_handler_stderr(const char *function, const char *file,
  */
 BOOL ntfs_log_parse_option(const char *option)
 {
-	if (strcmp(option, "--log-debug") == 0) {
-		ntfs_log_set_levels(NTFS_LOG_LEVEL_DEBUG);
-		return TRUE;
-	} else if (strcmp(option, "--log-verbose") == 0) {
-		ntfs_log_set_levels(NTFS_LOG_LEVEL_VERBOSE);
-		return TRUE;
-	} else if (strcmp(option, "--log-quiet") == 0) {
-		ntfs_log_clear_levels(NTFS_LOG_LEVEL_QUIET);
-		return TRUE;
-	} else if (strcmp(option, "--log-trace") == 0) {
-		ntfs_log_set_levels(NTFS_LOG_LEVEL_TRACE);
-		return TRUE;
-	}
+	unsigned int i;
 
+	for (i=0; i<sizeof(ntfs_log_options)/sizeof(ntfs_log_options[0]); i++) {
+		if (!strcmp(option, ntfs_log_options[i].name)) {
+			if (ntfs_log_options[i].clear)
+				ntfs_log_clear_levels(ntfs_log_options[i].levels);
+			else
+				ntfs_log_set_levels(ntfs_log_options[i].levels);
+			return TRUE;
+		}
+	}
 	ntfs_log_debug("Unknown logging option '%s'\n", option);
 	return FALSE;
 }
