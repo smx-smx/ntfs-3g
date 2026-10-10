@@ -4433,11 +4433,16 @@ int main(int argc, char *argv[])
 	if (drop_privs())
 		goto err_out;
 #endif	
+#ifdef WINDOWS
+		/* devices cannot be checked by stat() on Windows */
+	memset(&sbuf, 0, sizeof(sbuf));
+#else
 	if (stat(opts.device, &sbuf)) {
 		ntfs_log_perror("Failed to access '%s'", opts.device);
 		err = NTFS_VOLUME_NO_PRIVILEGE;
 		goto err_out;
 	}
+#endif
 
 #if !(defined(__sun) && defined (__SVR4))
 	/* Always use fuseblk for block devices unless it's surely missing. */
