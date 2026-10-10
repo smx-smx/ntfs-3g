@@ -188,7 +188,7 @@ install-data-hook:
 	$(LN_S) -f mkntfs.8 $(DESTDIR)$(man8dir)/mkfs.ntfs.8
 
 uninstall-local:
-	$(RM) -f $(DESTDIR)/sbin/mkfs.ntfs
+	$(RM) -f $(DESTDIR)$(sbindir)/mkfs.ntfs
 	$(RM) -f $(DESTDIR)$(man8dir)/mkfs.ntfs.8
 endif
 

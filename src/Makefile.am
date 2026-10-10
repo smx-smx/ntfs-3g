@@ -86,6 +86,7 @@ install-data-local:	install-man8
 
 uninstall-local:
 	$(RM) -f "$(DESTDIR)$(man8dir)/mount.ntfs-3g.8"
+	$(RM) -f "$(DESTDIR)$(man8dir)/mount.lowntfs-3g.8"
 	$(RM) -f "$(DESTDIR)/sbin/mount.ntfs-3g" "$(DESTDIR)/sbin/mount.lowntfs-3g"
 endif
 
