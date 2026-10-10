@@ -691,7 +691,8 @@ static int ntfs_device_win32_getgeo(HANDLE handle, win32_fd *fd)
 		fd->geo_cylinders = ((DISK_GEOMETRY*)&b)->Cylinders.QuadPart;
 		fd->geo_sectors = ((DISK_GEOMETRY*)&b)->SectorsPerTrack;
 		fd->geo_size = ((DISK_GEOMETRY_EX*)&b)->DiskSize.QuadPart;
-		fd->geo_sector_size = NTFS_BLOCK_SIZE;
+		fd->geo_sector_size =
+			((DISK_GEOMETRY_EX*)&b)->Geometry.BytesPerSector;
 		switch (ddi->DetectionType) {
 		case DetectInt13:
 			fd->geo_cylinders = ddi->Int13.MaxCylinders;
