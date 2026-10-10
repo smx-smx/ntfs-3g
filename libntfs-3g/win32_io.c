@@ -1208,8 +1208,10 @@ static int ntfs_device_win32_open(struct ntfs_device *dev, int flags)
 	    && (dev->d_name[2] == '\0')) {
 		drive_char = dev->d_name[0];
 		numparams = 3;
-		drive_id = toupper(drive_char) - 'A';
 	}
+		/* "/dev/hda" is the first drive, as is "A:" */
+	if (numparams > 0)
+		drive_id = toupper(drive_char) - 'A';
 	switch (numparams) {
 	case 0:
 		ntfs_log_debug("win32_open(%s) -> file.\n", dev->d_name);
