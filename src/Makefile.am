@@ -71,7 +71,7 @@ if RUN_LDCONFIG
 	$(LDCONFIG)
 endif
 if !DISABLE_PLUGINS
-	$(MKDIR_P) $(DESTDIR)/$(plugindir)
+	$(MKDIR_P) $(DESTDIR)$(plugindir)
 endif
 
 if ENABLE_MOUNT_HELPER

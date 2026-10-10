@@ -61,22 +61,30 @@ endif
 install-exec-hook: install-rootlibLTLIBRARIES
 if INSTALL_LIBRARY
 	if [ ! "$(rootlibdir)" -ef "$(libdir)" ]; then \
-		$(MV) -f "$(DESTDIR)/$(libdir)"/libntfs-3g.so* "$(DESTDIR)/$(rootlibdir)";  \
+		$(MKDIR_P) "$(DESTDIR)$(rootlibdir)"; \
+		for f in "$(DESTDIR)$(libdir)"/libntfs-3g$(SHREXT)*; do \
+			case "$$f" in \
+			*.dll.a) ;; \
+			*) if [ -e "$$f" ]; then \
+				$(MV) -f "$$f" "$(DESTDIR)$(rootlibdir)"; \
+			   fi ;; \
+			esac; \
+		done; \
 	fi
 if GENERATE_LDSCRIPT
 	if [ ! "$(rootlibdir)" -ef "$(libdir)" ]; then \
-		$(install_sh_PROGRAM) "libntfs-3g.script.so" "$(DESTDIR)/$(libdir)/libntfs-3g.so"; \
+		$(install_sh_PROGRAM) "libntfs-3g.script.so" "$(DESTDIR)$(libdir)/libntfs-3g.so"; \
 	fi
 else
 	if [ ! "$(rootlibdir)" -ef "$(libdir)" ]; then \
-		$(LN_S) "$(rootlibdir)/libntfs-3g.so" "$(DESTDIR)/$(libdir)/libntfs-3g.so"; \
+		$(LN_S) "$(rootlibdir)/libntfs-3g$(SHREXT)" "$(DESTDIR)$(libdir)/libntfs-3g$(SHREXT)"; \
 	fi
 endif
 endif
 
 uninstall-local:
 if INSTALL_LIBRARY
-	$(RM) -f "$(DESTDIR)/$(rootlibdir)"/libntfs-3g.so*
+	$(RM) -f "$(DESTDIR)$(rootlibdir)"/libntfs-3g$(SHREXT)*
 endif
 
 if ENABLE_NTFSPROGS

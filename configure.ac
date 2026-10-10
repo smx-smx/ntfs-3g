@@ -199,6 +199,11 @@ ifdef(
 	[AC_PROG_LIBTOOL]
 )
 
+# Extension of shared libraries, needed for moving them when installing
+module=no
+eval "SHREXT=\"${shrext_cmds}\""
+AC_SUBST([SHREXT])
+
 AC_PROG_INSTALL
 PKG_PROG_PKG_CONFIG
 
